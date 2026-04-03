@@ -1,0 +1,230 @@
+# =============================================================================
+# k8s-deploy-template.yaml
+# Production-ready Kubernetes manifest template.
+# Includes: Namespace, Deployment, Service, HorizontalPodAutoscaler,
+#           PodDisruptionBudget, ConfigMap, and ServiceAccount.
+#
+# Replace all <PLACEHOLDERS> before applying:
+#   <APP_NAME>       → your app name, e.g. api-server
+#   <NAMESPACE>      → your namespace, e.g. production
+#   <IMAGE>          → full image reference, e.g. ghcr.io/org/app:sha-abc123
+#   <PORT>           → container port, e.g. 8080
+#   <HEALTH_PATH>    → liveness/readiness probe path, e.g. /healthz
+#
+# Apply:
+#   kubectl apply -f k8s-deploy-template.yaml
+# =============================================================================
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: <NAMESPACE>
+  labels:
+    managed-by: kubectl
+    environment: production
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: <APP_NAME>
+  namespace: <NAMESPACE>
+  labels:
+    app: <APP_NAME>
+automountServiceAccountToken: false
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: <APP_NAME>-config
+  namespace: <NAMESPACE>
+data:
+  LOG_LEVEL: "info"
+  # Add non-secret environment config here.
+  # For secrets, use a Kubernetes Secret or an external secrets operator.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: <APP_NAME>
+  namespace: <NAMESPACE>
+  labels:
+    app: <APP_NAME>
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: <APP_NAME>
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0   # Zero-downtime deploys
+  template:
+    metadata:
+      labels:
+        app: <APP_NAME>
+      annotations:
+        # Force pod restart on configmap change (checksum trick)
+        # Update this value when the ConfigMap changes.
+        checksum/config: "placeholder-update-on-configmap-change"
+    spec:
+      serviceAccountName: <APP_NAME>
+      terminationGracePeriodSeconds: 30
+
+      # Security hardening at pod level
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread pods across nodes for HA
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: <APP_NAME>
+
+      containers:
+        - name: <APP_NAME>
+          image: <IMAGE>
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: <PORT>
+              protocol: TCP
+
+          envFrom:
+            - configMapRef:
+                name: <APP_NAME>-config
+          # Uncomment to mount a Secret:
+          # - secretRef:
+          #     name: <APP_NAME>-secret
+
+          # Security hardening at container level
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          # Writable temp dir (required when rootFilesystem is read-only)
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+          # Resource requests & limits — tune per app
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          livenessProbe:
+            httpGet:
+              path: <HEALTH_PATH>
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: <HEALTH_PATH>
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          startupProbe:
+            httpGet:
+              path: <HEALTH_PATH>
+              port: http
+            failureThreshold: 30   # 30 * 10s = 5 min max startup time
+            periodSeconds: 10
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: <APP_NAME>
+  namespace: <NAMESPACE>
+  labels:
+    app: <APP_NAME>
+spec:
+  type: ClusterIP
+  selector:
+    app: <APP_NAME>
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: <APP_NAME>
+  namespace: <NAMESPACE>
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: <APP_NAME>
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300   # Wait 5 min before scaling down
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: <APP_NAME>
+  namespace: <NAMESPACE>
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: <APP_NAME>

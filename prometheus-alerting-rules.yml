@@ -1,0 +1,223 @@
+# =============================================================================
+# prometheus-alerting-rules.yml
+# Common Prometheus alerting rules for production DevOps environments.
+#
+# Categories:
+#   - Node (CPU, memory, disk, load)
+#   - Kubernetes pods & deployments
+#   - PostgreSQL
+#   - Application (error rate, latency, saturation)
+#
+# Usage:
+#   1. Save to your Prometheus rules directory (e.g., /etc/prometheus/rules/)
+#   2. Reference in prometheus.yml:
+#        rule_files:
+#          - /etc/prometheus/rules/*.yml
+#   3. Reload Prometheus: curl -X POST http://localhost:9090/-/reload
+#
+# Requires: node_exporter, kube-state-metrics, postgres_exporter (for DB rules)
+# =============================================================================
+
+groups:
+
+  # ---------------------------------------------------------------------------
+  # Node / Host Alerts
+  # ---------------------------------------------------------------------------
+  - name: node_alerts
+    interval: 1m
+    rules:
+
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value | printf \"%.1f\" }}% (threshold: 85%) on {{ $labels.instance }} for 5+ minutes."
+
+      - alert: CriticalCPUUsage
+        expr: |
+          100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 95
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical CPU usage on {{ $labels.instance }}"
+          description: "CPU usage is {{ $value | printf \"%.1f\" }}% (threshold: 95%) on {{ $labels.instance }}."
+
+      - alert: HighMemoryUsage
+        expr: |
+          (node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes)
+          / node_memory_MemTotal_bytes * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.instance }}"
+          description: "Memory usage is {{ $value | printf \"%.1f\" }}% on {{ $labels.instance }}."
+
+      - alert: DiskSpaceWarning
+        expr: |
+          100 - (node_filesystem_avail_bytes{fstype!~"tmpfs|devtmpfs"}
+          / node_filesystem_size_bytes{fstype!~"tmpfs|devtmpfs"} * 100) > 75
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Disk space warning on {{ $labels.instance }}"
+          description: "Disk {{ $labels.mountpoint }} is {{ $value | printf \"%.1f\" }}% full on {{ $labels.instance }}."
+
+      - alert: DiskSpaceCritical
+        expr: |
+          100 - (node_filesystem_avail_bytes{fstype!~"tmpfs|devtmpfs"}
+          / node_filesystem_size_bytes{fstype!~"tmpfs|devtmpfs"} * 100) > 90
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical disk space on {{ $labels.instance }}"
+          description: "Disk {{ $labels.mountpoint }} is {{ $value | printf \"%.1f\" }}% full on {{ $labels.instance }}."
+
+      - alert: HighSystemLoad
+        expr: node_load15 / on(instance) count by(instance)(node_cpu_seconds_total{mode="idle"}) > 1.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High system load on {{ $labels.instance }}"
+          description: "15-min load average per core is {{ $value | printf \"%.2f\" }} (threshold: 1.5)."
+
+      - alert: NodeDown
+        expr: up{job="node"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Node is down: {{ $labels.instance }}"
+          description: "Node exporter on {{ $labels.instance }} has been unreachable for 1+ minute."
+
+  # ---------------------------------------------------------------------------
+  # Kubernetes Alerts
+  # ---------------------------------------------------------------------------
+  - name: kubernetes_alerts
+    interval: 1m
+    rules:
+
+      - alert: PodCrashLooping
+        expr: rate(kube_pod_container_status_restarts_total[15m]) * 60 > 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pod crash-looping: {{ $labels.namespace }}/{{ $labels.pod }}"
+          description: "Container {{ $labels.container }} in pod {{ $labels.pod }} is restarting more than once per minute."
+
+      - alert: PodNotReady
+        expr: |
+          kube_pod_status_ready{condition="true"} == 0
+          and kube_pod_status_phase{phase="Running"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pod not ready: {{ $labels.namespace }}/{{ $labels.pod }}"
+          description: "Pod {{ $labels.pod }} has been running but not ready for 5+ minutes."
+
+      - alert: DeploymentReplicasMismatch
+        expr: |
+          kube_deployment_spec_replicas != kube_deployment_status_available_replicas
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Deployment replicas mismatch: {{ $labels.namespace }}/{{ $labels.deployment }}"
+          description: "Desired: {{ $value }} replicas, but available count differs for 5+ minutes."
+
+      - alert: PersistentVolumeClaimPending
+        expr: kube_persistentvolumeclaim_status_phase{phase="Pending"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PVC stuck in Pending: {{ $labels.namespace }}/{{ $labels.persistentvolumeclaim }}"
+          description: "PVC has been in Pending state for 5+ minutes."
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL Alerts (requires postgres_exporter)
+  # ---------------------------------------------------------------------------
+  - name: postgresql_alerts
+    interval: 1m
+    rules:
+
+      - alert: PostgreSQLDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "PostgreSQL is down: {{ $labels.instance }}"
+          description: "postgres_exporter cannot reach the database on {{ $labels.instance }}."
+
+      - alert: PostgreSQLHighConnections
+        expr: |
+          sum by(instance) (pg_stat_activity_count)
+          / pg_settings_max_connections * 100 > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "PostgreSQL high connection usage on {{ $labels.instance }}"
+          description: "Connection usage is {{ $value | printf \"%.1f\" }}% (threshold: 80%)."
+
+      - alert: PostgreSQLLongRunningQuery
+        expr: |
+          max by(instance, usename) (
+            pg_stat_activity_max_tx_duration{state="active", usename!=""}
+          ) > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Long-running PostgreSQL query on {{ $labels.instance }}"
+          description: "User {{ $labels.usename }} has a query running for {{ $value | printf \"%.0f\" }} seconds."
+
+  # ---------------------------------------------------------------------------
+  # Application / API Alerts (assumes Prometheus HTTP metrics)
+  # ---------------------------------------------------------------------------
+  - name: application_alerts
+    interval: 30s
+    rules:
+
+      - alert: HighErrorRate
+        expr: |
+          sum by(job) (rate(http_requests_total{status=~"5.."}[5m]))
+          / sum by(job) (rate(http_requests_total[5m])) * 100 > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High HTTP error rate for {{ $labels.job }}"
+          description: "{{ $value | printf \"%.1f\" }}% of requests are returning 5xx errors (threshold: 5%)."
+
+      - alert: SlowResponseTime
+        expr: |
+          histogram_quantile(0.99,
+            sum by(job, le) (rate(http_request_duration_seconds_bucket[5m]))
+          ) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow p99 response time for {{ $labels.job }}"
+          description: "p99 latency is {{ $value | printf \"%.2f\" }}s (threshold: 2s)."
+
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service is down: {{ $labels.job }} / {{ $labels.instance }}"
+          description: "Prometheus cannot scrape {{ $labels.instance }} (job: {{ $labels.job }}) for 1+ minute."
