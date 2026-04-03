@@ -1,4 +1,4 @@
-# ⚡ donny-devops / gists
+# ⚡ Gists
 
 Reusable DevOps scripts, configs, and templates. Copy, adapt, and ship.
 
